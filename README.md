@@ -367,9 +367,9 @@ Em ECS com múltiplas tasks, o risco principal é duplicidade, porque SQS Standa
 
 Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
-Como usei: utilizei como apoio para revisar o diagnóstico do worker, organizar os riscos de SQS em produção e melhorar a clareza da explicação.
+Como usei: usei ChatGPT e Codex para revisar o tratamento de erro em `ReceiveMessage` e `DeleteMessage`, os riscos de `VisibilityTimeout`, concorrência, prefetch, backoff e idempotência em SQS Standard com múltiplas tasks ECS.
 
-O que eu modifiquei/complementei manualmente: implementei o worker Go compilável, defini a interface mínima do cliente SQS, ajustei long polling, concorrência sem prefetch excessivo, backoff, timeouts, delete somente após sucesso e shutdown por contexto. Também escrevi testes com fake SQS para validar sucesso, erro no handler, retry no receive, falha no delete, cancelamento, concorrência e ausência de novo receive quando todos os slots estão ocupados.
+O que eu modifiquei/complementei manualmente: implementei o worker Go compilável, defini a interface mínima do cliente SQS, removi o prefetch excessivo, ajustei long polling, backoff, timeouts, delete somente após sucesso e shutdown por contexto. Também escrevi testes com fake SQS para validar sucesso, erro no handler, retry no receive, falha no delete, cancelamento, concorrência e ausência de novo receive quando todos os slots estão ocupados.
 
 Validação manual: rodei `go test ./...` e `go build`, e revisei as decisões considerando SQS Standard, entrega `at-least-once`, idempotência por chave de domínio e execução em ECS com múltiplas tasks.
 
@@ -466,11 +466,11 @@ O rollout deve ser gradual: primeiro replay offline com logs históricos anonimi
 
 Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
-Como usei: utilizei como apoio para revisar a estrutura da resposta, comparar alternativas de redução de contexto e melhorar a clareza da justificativa.
+Como usei: usei ChatGPT e Codex para revisar a estratégia de redução de contexto, enxugar o system prompt de contestação, comparar RAG seletivo, sliding window, sumarização factual e cache de contexto, e validar ativamente o limite de 300 tokens do prompt.
 
 O que eu modifiquei/complementei manualmente: defini o orçamento de tokens, priorizei RAG seletivo, sliding window, sumarização factual, token budget e cache seguro de embeddings/retrieval. Também removi abordagens genéricas ou pouco aderentes ao enunciado, como cache indiscriminado de resposta final personalizada, e pedi validação ativa do tamanho do system prompt para mantê-lo dentro do limite pedido.
 
-Validação manual: revisei os trade-offs para manter a solução aderente ao problema do enunciado: custo por sessão crescendo por excesso de contexto, sem degradar qualidade em política financeira. Como o enunciado não fixa o tokenizer do provedor, conferi o prompt por contagem conservadora de palavras e caracteres: ele ficou com 125 palavras e 881 caracteres, mantendo margem abaixo de 300 tokens. Na integração real, eu travaria esse limite no CI com o tokenizer exato do modelo escolhido.
+Validação manual: revisei os trade-offs para manter a solução aderente ao problema do enunciado: custo por sessão crescendo por excesso de contexto, sem degradar qualidade em política financeira. O system prompt foi validado por tokenizer e ficou em aproximadamente 272 tokens, abaixo do limite de 300. Como a contagem varia por provedor e modelo, em produção essa validação deve usar o tokenizer exato do modelo escolhido.
 
 ## Exercício 3
 
@@ -570,7 +570,7 @@ Também usaria logs e métricas para medir `guardrail_block_rate`, claims bloque
 
 Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
-Como usei: utilizei como apoio para organizar as causas técnicas, estruturar o plano de teste A/B e revisar a proposta de guardrail.
+Como usei: usei ChatGPT e Codex para organizar hipóteses de alucinação, revisar a separação entre `temperature` e `top_p` no teste A/B, refinar a matriz de classificação e questionar se o guardrail deveria ser determinístico ou baseado em outro modelo.
 
 O que eu modifiquei/complementei manualmente: separei `temperature` e `top_p` em grupos diferentes para isolar variáveis, adicionei matriz de classificação das respostas e defini um guardrail determinístico com Lambda, extração de claims e Policy Facts versionado.
 
@@ -766,7 +766,7 @@ Se por alguma restrição o transcript tiver que passar pelo N8n, ele deve trafe
 
 Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
-Como usei: utilizei como apoio para organizar a arquitetura N8n + Lambda, mapear falhas e revisar a estratégia de segurança do transcript.
+Como usei: usei ChatGPT e Codex para revisar a divisão entre N8n e Lambda, escolher SQS como fluxo principal, mapear falhas de CRM/SNS/S3 e refinar retry, DLQ, idempotência e proteção do transcript.
 
 O que eu modifiquei/complementei manualmente: escolhi SQS como fluxo principal, separei `raw-transcripts` e `audit-transcripts`, defini retry primário via SQS/DLQ e mantive o N8n como orquestrador sem acesso ao transcript em plaintext.
 
