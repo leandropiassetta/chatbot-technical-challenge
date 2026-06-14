@@ -21,6 +21,7 @@ type fakeSQS struct {
 	deleteCalls      int
 	deletedReceipts  []string
 	lastReceiveInput *sqs.ReceiveMessageInput
+	receiveInputs    []*sqs.ReceiveMessageInput
 	receiveFn        func(context.Context, *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error)
 	deleteFn         func(context.Context, *sqs.DeleteMessageInput) (*sqs.DeleteMessageOutput, error)
 }
@@ -29,6 +30,7 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessage
 	f.mu.Lock()
 	f.receiveCalls++
 	f.lastReceiveInput = params
+	f.receiveInputs = append(f.receiveInputs, params)
 	f.mu.Unlock()
 
 	if f.receiveFn != nil {
@@ -58,6 +60,16 @@ func (f *fakeSQS) snapshot() (receiveCalls int, deleteCalls int, deletedReceipts
 
 	deletedReceipts = append([]string(nil), f.deletedReceipts...)
 	return f.receiveCalls, f.deleteCalls, deletedReceipts, f.lastReceiveInput
+}
+
+func (f *fakeSQS) firstReceiveInput() *sqs.ReceiveMessageInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.receiveInputs) == 0 {
+		return nil
+	}
+	return f.receiveInputs[0]
 }
 
 func TestRunDeletesMessageAfterSuccessfulHandler(t *testing.T) {
@@ -97,18 +109,22 @@ func TestRunDeletesMessageAfterSuccessfulHandler(t *testing.T) {
 		t.Fatal("handler was not called")
 	}
 
-	_, deleteCalls, deletedReceipts, input := client.snapshot()
+	_, deleteCalls, deletedReceipts, _ := client.snapshot()
 	if deleteCalls != 1 {
 		t.Fatalf("expected 1 delete call, got %d", deleteCalls)
 	}
 	if len(deletedReceipts) != 1 || deletedReceipts[0] != "receipt-1" {
 		t.Fatalf("unexpected deleted receipts: %v", deletedReceipts)
 	}
+	input := client.firstReceiveInput()
+	if input == nil {
+		t.Fatal("expected receive input")
+	}
 	if input.WaitTimeSeconds != 20 {
 		t.Fatalf("expected long polling with WaitTimeSeconds=20, got %d", input.WaitTimeSeconds)
 	}
-	if input.MaxNumberOfMessages != 10 {
-		t.Fatalf("expected batch receive with MaxNumberOfMessages=10, got %d", input.MaxNumberOfMessages)
+	if input.MaxNumberOfMessages != 1 {
+		t.Fatalf("expected receive to be bounded by available slots, got %d", input.MaxNumberOfMessages)
 	}
 }
 
@@ -263,14 +279,13 @@ func TestRunRespectsConfiguredConcurrency(t *testing.T) {
 
 	client := &fakeSQS{}
 	var receiveAttempt atomic.Int32
-	client.receiveFn = func(ctx context.Context, _ *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error) {
+	firstReceiveMax := make(chan int32, 1)
+	client.receiveFn = func(ctx context.Context, input *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error) {
 		if receiveAttempt.Add(1) == 1 {
+			firstReceiveMax <- input.MaxNumberOfMessages
 			return &sqs.ReceiveMessageOutput{Messages: []types.Message{
 				sqsMessage("msg-1", "receipt-1", "{}"),
 				sqsMessage("msg-2", "receipt-2", "{}"),
-				sqsMessage("msg-3", "receipt-3", "{}"),
-				sqsMessage("msg-4", "receipt-4", "{}"),
-				sqsMessage("msg-5", "receipt-5", "{}"),
 			}}, nil
 		}
 		<-ctx.Done()
@@ -302,9 +317,23 @@ func TestRunRespectsConfiguredConcurrency(t *testing.T) {
 
 	waitForNSignals(t, started, 2, "handlers to start")
 	select {
+	case got := <-firstReceiveMax:
+		if got != 2 {
+			t.Fatalf("expected first receive to request 2 messages, got %d", got)
+		}
+	default:
+		t.Fatal("first receive was not recorded")
+	}
+
+	select {
 	case <-started:
 		t.Fatal("worker started more handlers than configured concurrency")
 	case <-time.After(30 * time.Millisecond):
+	}
+
+	receiveCalls, _, _, _ := client.snapshot()
+	if receiveCalls != 1 {
+		t.Fatalf("expected no extra receive while all workers are busy, got %d receive calls", receiveCalls)
 	}
 
 	cancel()

@@ -110,33 +110,33 @@ func (c WorkerConfig) validate() error {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	jobs := make(chan types.Message, w.cfg.Concurrency*int(w.cfg.MaxMessages))
-
 	var wg sync.WaitGroup
-	for i := 0; i < w.cfg.Concurrency; i++ {
-		wg.Add(1)
-		go w.consume(ctx, i, jobs, &wg)
-	}
 	defer func() {
-		close(jobs)
 		wg.Wait()
 	}()
 
+	slots := make(chan struct{}, w.cfg.Concurrency)
 	backoff := w.cfg.ReceiveBackoff
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
+		availableSlots := acquireSlots(ctx, slots, int(w.cfg.MaxMessages))
+		if availableSlots == 0 {
+			return nil
+		}
+
 		out, err := w.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:                    aws.String(w.cfg.QueueURL),
-			MaxNumberOfMessages:         w.cfg.MaxMessages,
+			MaxNumberOfMessages:         int32(availableSlots),
 			WaitTimeSeconds:             w.cfg.WaitTimeSeconds,
 			VisibilityTimeout:           w.cfg.VisibilityTimeout,
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameApproximateReceiveCount},
 			MessageAttributeNames:       []string{"All"},
 		})
 		if err != nil {
+			releaseSlots(slots, availableSlots)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -152,37 +152,27 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		backoff = w.cfg.ReceiveBackoff
+		unusedSlots := availableSlots - len(out.Messages)
+		if unusedSlots > 0 {
+			releaseSlots(slots, unusedSlots)
+		}
+
 		for _, msg := range out.Messages {
-			select {
-			case jobs <- msg:
-			case <-ctx.Done():
-				return nil
-			}
+			wg.Add(1)
+			go func(msg types.Message) {
+				defer wg.Done()
+				defer releaseSlots(slots, 1)
+				w.processOne(ctx, msg)
+			}(msg)
 		}
 	}
 }
 
-func (w *Worker) consume(ctx context.Context, workerID int, jobs <-chan types.Message, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg, ok := <-jobs:
-			if !ok {
-				return
-			}
-			w.processOne(ctx, workerID, msg)
-		}
-	}
-}
-
-func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message) {
+func (w *Worker) processOne(ctx context.Context, msg types.Message) {
 	messageID := aws.ToString(msg.MessageId)
 	receiptHandle := aws.ToString(msg.ReceiptHandle)
 	if receiptHandle == "" {
-		w.logger.Error("message without receipt handle", "message_id", messageID, "worker_id", workerID)
+		w.logger.Error("message without receipt handle", "message_id", messageID)
 		return
 	}
 
@@ -195,7 +185,6 @@ func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message
 			"error", err,
 			"message_id", messageID,
 			"receive_count", msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)],
-			"worker_id", workerID,
 		)
 		return
 	}
@@ -211,7 +200,38 @@ func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message
 		return
 	}
 
-	w.logger.Info("message processed", "message_id", messageID, "worker_id", workerID)
+	w.logger.Info("message processed", "message_id", messageID)
+}
+
+func acquireSlots(ctx context.Context, slots chan struct{}, limit int) int {
+	acquired := 0
+	for acquired < limit {
+		select {
+		case slots <- struct{}{}:
+			acquired++
+		case <-ctx.Done():
+			releaseSlots(slots, acquired)
+			return 0
+		default:
+			if acquired > 0 {
+				return acquired
+			}
+
+			select {
+			case slots <- struct{}{}:
+				acquired++
+			case <-ctx.Done():
+				return 0
+			}
+		}
+	}
+	return acquired
+}
+
+func releaseSlots(slots <-chan struct{}, count int) {
+	for i := 0; i < count; i++ {
+		<-slots
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {

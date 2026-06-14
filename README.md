@@ -172,33 +172,33 @@ func (c WorkerConfig) validate() error {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	jobs := make(chan types.Message, w.cfg.Concurrency*int(w.cfg.MaxMessages))
-
 	var wg sync.WaitGroup
-	for i := 0; i < w.cfg.Concurrency; i++ {
-		wg.Add(1)
-		go w.consume(ctx, i, jobs, &wg)
-	}
 	defer func() {
-		close(jobs)
 		wg.Wait()
 	}()
 
+	slots := make(chan struct{}, w.cfg.Concurrency)
 	backoff := w.cfg.ReceiveBackoff
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
+		availableSlots := acquireSlots(ctx, slots, int(w.cfg.MaxMessages))
+		if availableSlots == 0 {
+			return nil
+		}
+
 		out, err := w.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:                    aws.String(w.cfg.QueueURL),
-			MaxNumberOfMessages:         w.cfg.MaxMessages,
+			MaxNumberOfMessages:         int32(availableSlots),
 			WaitTimeSeconds:             w.cfg.WaitTimeSeconds,
 			VisibilityTimeout:           w.cfg.VisibilityTimeout,
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameApproximateReceiveCount},
 			MessageAttributeNames:       []string{"All"},
 		})
 		if err != nil {
+			releaseSlots(slots, availableSlots)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -214,37 +214,27 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		backoff = w.cfg.ReceiveBackoff
+		unusedSlots := availableSlots - len(out.Messages)
+		if unusedSlots > 0 {
+			releaseSlots(slots, unusedSlots)
+		}
+
 		for _, msg := range out.Messages {
-			select {
-			case jobs <- msg:
-			case <-ctx.Done():
-				return nil
-			}
+			wg.Add(1)
+			go func(msg types.Message) {
+				defer wg.Done()
+				defer releaseSlots(slots, 1)
+				w.processOne(ctx, msg)
+			}(msg)
 		}
 	}
 }
 
-func (w *Worker) consume(ctx context.Context, workerID int, jobs <-chan types.Message, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg, ok := <-jobs:
-			if !ok {
-				return
-			}
-			w.processOne(ctx, workerID, msg)
-		}
-	}
-}
-
-func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message) {
+func (w *Worker) processOne(ctx context.Context, msg types.Message) {
 	messageID := aws.ToString(msg.MessageId)
 	receiptHandle := aws.ToString(msg.ReceiptHandle)
 	if receiptHandle == "" {
-		w.logger.Error("message without receipt handle", "message_id", messageID, "worker_id", workerID)
+		w.logger.Error("message without receipt handle", "message_id", messageID)
 		return
 	}
 
@@ -257,7 +247,6 @@ func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message
 			"error", err,
 			"message_id", messageID,
 			"receive_count", msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)],
-			"worker_id", workerID,
 		)
 		return
 	}
@@ -273,7 +262,38 @@ func (w *Worker) processOne(ctx context.Context, workerID int, msg types.Message
 		return
 	}
 
-	w.logger.Info("message processed", "message_id", messageID, "worker_id", workerID)
+	w.logger.Info("message processed", "message_id", messageID)
+}
+
+func acquireSlots(ctx context.Context, slots chan struct{}, limit int) int {
+	acquired := 0
+	for acquired < limit {
+		select {
+		case slots <- struct{}{}:
+			acquired++
+		case <-ctx.Done():
+			releaseSlots(slots, acquired)
+			return 0
+		default:
+			if acquired > 0 {
+				return acquired
+			}
+
+			select {
+			case slots <- struct{}{}:
+				acquired++
+			case <-ctx.Done():
+				return 0
+			}
+		}
+	}
+	return acquired
+}
+
+func releaseSlots(slots <-chan struct{}, count int) {
+	for i := 0; i < count; i++ {
+		<-slots
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -304,9 +324,19 @@ func minDuration(a, b time.Duration) time.Duration {
 }
 ```
 
-Neste exemplo, o worker usa `HandlerTimeout` menor que `VisibilityTimeout` para manter o processamento dentro da janela de visibilidade. Para workloads com duração imprevisível, eu adicionaria renovação periódica com `ChangeMessageVisibility`, mas deixaria isso fora do núcleo inicial para manter o contrato do worker simples e testável.
+O worker não faz prefetch além da capacidade real de processamento: antes de chamar `ReceiveMessage`, ele reserva slots de concorrência e recebe no máximo a quantidade de slots livres. Isso evita que mensagens fiquem paradas em um buffer interno enquanto o `VisibilityTimeout` já está contando na SQS. Neste exemplo, o worker também usa `HandlerTimeout` menor que `VisibilityTimeout` para manter o processamento dentro da janela de visibilidade. Para workloads com duração imprevisível, eu adicionaria renovação periódica com `ChangeMessageVisibility`, mas deixaria isso fora do núcleo inicial para manter o contrato do worker simples e testável.
 
 No `handleMessage`, eu colocaria a idempotência antes de qualquer efeito colateral. A chave principal deve ser uma chave de negócio, como `event_id`, ou no mínimo `session_id + event_type`. O `MessageId` da SQS ajuda na observabilidade, mas não deve ser a chave principal de deduplicação porque o mesmo evento de negócio pode ser republicado em outra mensagem.
+
+Exemplo do padrão de idempotência:
+
+```sql
+INSERT INTO processed_events (event_id, processed_at)
+VALUES (:event_id, now())
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+Se nenhuma linha for inserida, o evento já foi processado e o handler deve encerrar sem repetir efeitos colaterais. No shutdown, mensagens em processamento podem ser reentregues pela SQS; essa escolha é aceitável com entrega `at-least-once`, desde que a idempotência por `event_id` esteja correta.
 
 ### Respostas às perguntas de follow-up
 
@@ -319,17 +349,18 @@ Configuração esperada da fila:
 - `ReceiveMessageWaitTimeSeconds`: 20 segundos.
 - `VisibilityTimeout`: maior que o p99 do handler com margem, por exemplo 60 segundos se o p99 estiver até 25 segundos.
 - `RedrivePolicy`: DLQ configurada com `maxReceiveCount` entre 3 e 5 e `deadLetterTargetArn` apontando para `session-events-dlq`.
-- `MaxNumberOfMessages`: 10 no worker para receber em lote e reduzir chamadas à SQS.
+- `MaxNumberOfMessages`: até 10, limitado pela quantidade de slots livres de processamento para evitar prefetch excessivo.
 
 Em ECS com múltiplas tasks, o risco principal é duplicidade, porque SQS Standard entrega mensagens pelo menos uma vez. Também pode haver pressão excessiva em banco e APIs downstream se a escala subir sem limite. A mitigação é idempotência por `event_id`, controle de concorrência por task, autoscaling baseado em backlog/idade da fila, DLQ com `maxReceiveCount` e, se houver necessidade de ordem por sessão, avaliar SQS FIFO com `MessageGroupId=session_id`.
 
-### Testes que eu escreveria
+### Testes automatizados incluídos
 
 - Quando o handler retorna sucesso, o worker chama `DeleteMessage`.
 - Quando o handler retorna erro, o worker não chama `DeleteMessage`.
 - Quando `ReceiveMessage` falha, o worker registra erro e aplica backoff.
 - Quando o contexto é cancelado, o worker encerra sem vazar goroutines.
 - Quando há mais mensagens que workers, a concorrência máxima configurada é respeitada.
+- Quando todos os workers estão ocupados, o worker não faz novo `ReceiveMessage`, evitando prefetch que consome `VisibilityTimeout` parado em memória.
 - Quando `DeleteMessage` falha, a falha é logada e a idempotência cobre o reprocessamento futuro.
 
 ### IA utilizada
@@ -338,7 +369,7 @@ Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
 Como usei: utilizei como apoio para revisar o diagnóstico do worker, organizar os riscos de SQS em produção e melhorar a clareza da explicação.
 
-O que eu modifiquei/complementei manualmente: implementei o worker Go compilável, defini a interface mínima do cliente SQS, ajustei long polling, concorrência, backoff, timeouts, delete somente após sucesso e shutdown por contexto. Também escrevi testes com fake SQS para validar sucesso, erro no handler, retry no receive, falha no delete, cancelamento e concorrência.
+O que eu modifiquei/complementei manualmente: implementei o worker Go compilável, defini a interface mínima do cliente SQS, ajustei long polling, concorrência sem prefetch excessivo, backoff, timeouts, delete somente após sucesso e shutdown por contexto. Também escrevi testes com fake SQS para validar sucesso, erro no handler, retry no receive, falha no delete, cancelamento, concorrência e ausência de novo receive quando todos os slots estão ocupados.
 
 Validação manual: rodei `go test ./...` e `go build`, e revisei as decisões considerando SQS Standard, entrega `at-least-once`, idempotência por chave de domínio e execução em ECS com múltiplas tasks.
 
@@ -383,25 +414,25 @@ Trade-offs:
 ### 2b — System prompt otimizado para contestação de cobranças
 
 ```text
-Você é o assistente financeiro da Empresa X, especializado em contestação de cobranças.
+Você é assistente financeiro da Empresa X para contestação de cobranças.
 
-Use somente as informações de CONTEXTO_OFICIAL e DADOS_DA_SESSÃO. Se a resposta não estiver nesses dados, diga que não pode confirmar e encaminhe para atendimento humano. Não invente regras, prazos, valores, normas externas ou exceções.
+Use apenas CONTEXTO_OFICIAL e DADOS_DA_SESSÃO. Se faltar evidência, diga que não pode confirmar e encaminhe ao atendimento humano. Não invente prazos, valores, normas externas ou exceções.
 
-Siga esta verificação antes de responder: identifique a intenção do cliente, confira se há evidência no CONTEXTO_OFICIAL, valide prazo ou valor citado e responda apenas se houver suporte. Não exponha essa verificação.
+Antes de responder, confira: intenção, data da cobrança, prazo/valor citado, evidência oficial e próxima ação segura. Não exponha essa verificação.
 
-Regra oficial atual: o prazo para contestar uma cobrança é de 60 dias a partir da data da cobrança.
+Regra oficial: contestação em até 60 dias da data da cobrança.
 
-Responda em português, de forma curta, objetiva e empática. Quando negar uma solicitação, explique o motivo e ofereça alternativa segura.
+Responda em português, curto, objetivo e empático.
 
 Exemplo:
-Cliente: Posso contestar uma cobrança feita há 6 meses?
-Resposta: Não. Pela política oficial, o prazo de contestação é de 60 dias a partir da data da cobrança. Posso ajudar a revisar outras opções de atendimento para esse caso.
+Cliente: Posso contestar uma cobrança de 6 meses?
+Resposta: Não. Pela política oficial, o prazo é de 60 dias da cobrança. Posso encaminhar o caso para análise do atendimento.
 
 Cliente: Isso é regra do Banco Central?
-Resposta: Não tenho essa confirmação no contexto oficial disponível. Posso encaminhar sua solicitação para análise do atendimento.
+Resposta: Não tenho essa confirmação no contexto oficial. Posso encaminhar para análise.
 ```
 
-Justificativa: o prompt reduz o papel do modelo para uma tarefa estreita, declara a fonte de verdade, inclui fallback explícito, limita alucinação de normas externas e usa exemplos focados no erro observado. Eu não pediria para o modelo expor chain-of-thought; pediria apenas verificação interna e resposta final objetiva.
+Justificativa: o prompt reduz o papel do modelo para uma tarefa estreita, declara a fonte de verdade, inclui fallback explícito, limita alucinação de normas externas e usa exemplos focados no erro observado. Eu não pediria para o modelo expor chain-of-thought; pediria apenas verificação interna e resposta final objetiva. Também mantive o texto deliberadamente curto para ficar com margem abaixo do limite de 300 tokens.
 
 ### 2c — Medição de impacto na qualidade
 
@@ -437,9 +468,9 @@ Ferramentas usadas: ChatGPT e Codex (OpenAI).
 
 Como usei: utilizei como apoio para revisar a estrutura da resposta, comparar alternativas de redução de contexto e melhorar a clareza da justificativa.
 
-O que eu modifiquei/complementei manualmente: defini o orçamento de tokens, priorizei RAG seletivo, sliding window, sumarização factual, token budget e cache seguro de embeddings/retrieval. Também removi abordagens genéricas ou pouco aderentes ao enunciado, como cache indiscriminado de resposta final personalizada.
+O que eu modifiquei/complementei manualmente: defini o orçamento de tokens, priorizei RAG seletivo, sliding window, sumarização factual, token budget e cache seguro de embeddings/retrieval. Também removi abordagens genéricas ou pouco aderentes ao enunciado, como cache indiscriminado de resposta final personalizada, e pedi validação ativa do tamanho do system prompt para mantê-lo dentro do limite pedido.
 
-Validação manual: revisei os trade-offs para manter a solução aderente ao problema do enunciado: custo por sessão crescendo por excesso de contexto, sem degradar qualidade em política financeira.
+Validação manual: revisei os trade-offs para manter a solução aderente ao problema do enunciado: custo por sessão crescendo por excesso de contexto, sem degradar qualidade em política financeira. Como o enunciado não fixa o tokenizer do provedor, conferi o prompt por contagem conservadora de palavras e caracteres: ele ficou com 125 palavras e 881 caracteres, mantendo margem abaixo de 300 tokens. Na integração real, eu travaria esse limite no CI com o tokenizer exato do modelo escolhido.
 
 ## Exercício 3
 
